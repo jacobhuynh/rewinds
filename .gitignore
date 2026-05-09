@@ -1,0 +1,29 @@
+# Environment
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Node / React Native / Expo
+node_modules/
+.expo/
+dist/
+build/
+*.tsbuildinfo
+
+# Go binaries and build artifacts
+backend/bin/
+/bin/
+*.exe
+*.out
+
+# Go test cache
+/tmp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
