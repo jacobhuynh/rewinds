@@ -548,37 +548,100 @@ func getMatchup(genre string, upsetProbability float64) (Artist, Artist) {
 
 ---
 
-## Beli-style comparison rating flow
+## Rating flow
 
-When a user rates a new album or artist:
-1. User searches for an album/artist to rate
-2. App asks: "Do you like it more or less than [anchor item]?" (anchor = previously rated item in same rough tier)
-3. Binary search narrows down their personal ranked list
-4. After 3–5 comparisons, score is derived from position in ranking
-5. User can accept derived score or override manually
+Users always choose their rating method — the comparison flow is **never forced**.
 
-**Algorithm:**
+### Method A — Manual (always available)
+User enters a decimal score directly (e.g. `7.4`) or uses a star/slider input.
+Saved immediately as `rating_method: "manual"`.
+
+### Method B — Comparison flow (available once ≥ 5 ratings exist)
+
+**Step 1 — Category selection**
+
+User picks one of 5 broad sentiment categories:
+
+| Label | Score range | Starting score (first in category) |
+|---|---|---|
+| Very Bad | 0.0 – 2.0 | 1.0 |
+| Bad | 2.0 – 4.0 | 3.0 |
+| Ok | 4.0 – 6.0 | 5.0 |
+| Good | 6.0 – 8.0 | 7.0 |
+| Amazing | 8.0 – 10.0 | 9.0 |
+
+If this is the first item in the chosen category → skip to Step 3, assign starting score directly.
+
+**Step 2 — Server-driven binary search (within category)**
+
+- Session state (`low`, `high`, snapshot of that category's rated items) stored in Redis
+- `GET /comparisons/next` returns the midpoint item to compare against
+- User answers "better" or "worse" → `POST /comparisons` records the result and advances the session
+- Repeat until `low > high` — position falls out as the final `low` value
+- Boundary check: if the song lands at the top edge of its category, one extra comparison against the lowest-ranked item in the category above confirms or recategorizes it (same at bottom edge)
+
+**Step 3 — Score calculation**
+
+Manual ratings act as fixed window boundaries. Comparison items are distributed evenly within the window defined by the nearest manual scores above and below (or category bounds if no manual exists).
+
 ```go
-func findRatingPosition(userRatings []Rating, newItem Item) int {
-    low, high := 0, len(userRatings)-1
-    for low <= high {
-        mid := (low + high) / 2
-        if userPrefersNewItem(newItem, userRatings[mid]) {
-            high = mid - 1
-        } else {
-            low = mid + 1
-        }
+// ScoreInWindow distributes comparison items evenly within [lower, upper].
+// Scores approach but never reach `upper` — so comparison scores never equal
+// a manual score ranked above them, and 10.0 is only reachable via manual entry.
+//
+// position: 0-indexed (0 = best in window)
+// nTotal:   total comparison items in this window including this one
+// lower:    nearest manual score below (or category minimum)
+// upper:    nearest manual score above (or category maximum)
+func ScoreInWindow(position, nTotal int, lower, upper float64) float64 {
+    if nTotal <= 1 {
+        return (upper + lower) / 2.0 // midpoint when only one item in window
     }
-    return low
-}
-
-func positionToScore(position, total int) float64 {
-    if total == 0 { return 5.0 }
-    return 10.0 * (1.0 - float64(position)/float64(total+1))
+    step := (upper - lower) / float64(nTotal+1)
+    return upper - step*float64(position+1)
 }
 ```
 
-Manual rating (star input or decimal) is always available as an alternative — never force the comparison flow.
+**Example** — 1 manual at 9.5, 1 comparison above it:
+```
+window [9.5, 10.0], nTotal=1 → (9.5 + 10.0) / 2 = 9.75
+
+Result: 9.75 (comparison) | 9.5 (manual)
+```
+
+**Example** — 1 manual at 9.5, 1 comparison above, 1 below:
+```
+upper window [9.5, 10.0], nTotal=1 → 9.75 (comparison)
+lower window [8.0, 9.5],  nTotal=1 → 8.75 (comparison)
+
+Result: 9.75 (comparison) | 9.5 (manual) | 8.75 (comparison)
+```
+
+**Step 4 — Confirm or override**
+
+User sees the derived score and chooses:
+- **Accept** → saved as `rating_method: "comparison"`
+- **Edit the score** → saved as `rating_method: "manual"` (user's decimal wins; score is never auto-recalculated)
+- **Discard** → nothing saved
+
+**Step 5 — Recompute category scores after insertion**
+
+After a new `"comparison"` rating is saved, all `"comparison"` ratings in that category are rescored. The full sorted list (manual + comparison together) is used to identify windows, but only comparison scores are updated.
+
+```
+Sort all items in category by score descending.
+Split into windows at each manual rating:
+
+  [categoryMax] ... manual(9.5) ... manual(8.0) ... [categoryMin]
+       window 1         window 2
+
+For each window:
+  compItems = comparison items in this window
+  For each at position i:
+      score = ScoreInWindow(i, len(compItems), lower, upper)
+```
+
+Manual scores are fixed anchors — they bound the windows but are never recalculated. This prevents any comparison score from ever exceeding a manual score ranked above it.
 
 ---
 
